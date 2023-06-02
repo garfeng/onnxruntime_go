@@ -44,9 +44,12 @@ void ReleaseOrtMemoryInfo(OrtMemoryInfo *info);
 // Returns the message associated with the given ORT status.
 const char *GetErrorMessage(OrtStatus *status);
 
+// Wraps ort->CreateSessionOptions
+OrtStatus *CreateSessionOptions(OrtSessionOptions **options);
+
 // Creates an ORT session using the given model.
 OrtStatus *CreateSession(void *model_data, size_t model_data_length,
-  OrtEnv *env, OrtSession **out);
+  OrtEnv *env, OrtSessionOptions *options, OrtSession **out);
 
 // Runs an ORT session with the given input and output tensors, along with
 // their names. In our use case, outputs must NOT be NULL.
@@ -65,6 +68,12 @@ void ReleaseOrtValue(OrtValue *value);
 OrtStatus *CreateOrtTensorWithShape(void *data, size_t data_size,
   int64_t *shape, int64_t shape_size, OrtMemoryInfo *mem_info,
   ONNXTensorElementDataType dtype, OrtValue **out);
+
+// Wraps ort_api->SessionOptionsAppendExecutionProvider_CUDA
+OrtStatus *SessionOptionsAppendExecutionProvider_CUDA(OrtSessionOptions *options, OrtCUDAProviderOptions* cuda_options);
+
+// Wraps ort_api->SessionOptionsAppendExecutionProvider_TensorRT
+OrtStatus *SessionOptionsAppendExecutionProvider_TensorRT(OrtSessionOptions *options, OrtTensorRTProviderOptions* tensor_options);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -218,6 +218,10 @@ type Tensor[T TensorData] struct {
 	ortValue *C.OrtValue
 }
 
+type TensorDataOption struct {
+	UseFp16 bool
+}
+
 // Cleans up and frees the memory associated with this tensor.
 func (t *Tensor[_]) Destroy() error {
 	C.ReleaseOrtValue(t.ortValue)
@@ -270,7 +274,7 @@ func NewEmptyTensor[T TensorData](s Shape) (*Tensor[T], error) {
 // this function is copied, and is no longer needed after this function
 // returns. If the data slice is longer than s.FlattenedSize(), then only the
 // first portion of the data will be used.
-func NewTensor[T TensorData](s Shape, data []T) (*Tensor[T], error) {
+func NewTensor[T TensorData](s Shape, data []T, option ...*TensorDataOption) (*Tensor[T], error) {
 	if !IsInitialized() {
 		return nil, NotInitializedError
 	}
@@ -285,7 +289,7 @@ func NewTensor[T TensorData](s Shape, data []T) (*Tensor[T], error) {
 			len(data))
 	}
 	var ortValue *C.OrtValue
-	dataType := GetTensorElementDataType[T]()
+	dataType := GetTensorElementDataType[T](option...)
 	dataSize := unsafe.Sizeof(data[0]) * uintptr(elementCount)
 
 	status := C.CreateOrtTensorWithShape(unsafe.Pointer(&data[0]),
@@ -321,10 +325,57 @@ type Session[T TensorData] struct {
 	outputs []*C.OrtValue
 }
 
+type OrtSessionOptions = C.OrtSessionOptions
+
+type AppendOptions func(options *OrtSessionOptions) error
+
+type OrtCUDAProviderOptions struct {
+	DeviceId              int
+	CudnnConvAlgoSearch   OrtCudnnConvAlgoSearch
+	GpuMemLimit           uint64
+	ArenaExtendStrategy   int
+	DoCopyInDefaultStream bool
+	HasUserComputeStream  bool
+	UserComputeStream     unsafe.Pointer
+	DefaultMemoryArenaCfg *OrtArenaCfg
+	TunableOpEnabled      bool
+}
+
+type OrtTensorRTProviderOptions struct {
+	DeviceId                         int            ///< CUDA device id (0 = default device)
+	HasUserComputeStream             bool           // indicator of user specified CUDA compute stream.
+	UserComputeStream                unsafe.Pointer // user specified CUDA compute stream.
+	TrtMaxPartitionIterations        int            // maximum iterations for TensorRT parser to get capability
+	TrtMinSubgraphSize               int            // minimum size of TensorRT subgraphs
+	TrtMaxWorkspaceSize              uint64         // maximum workspace size for TensorRT.
+	TrtFp16Enable                    bool           // enable TensorRT FP16 precision. Default 0 = false, nonzero = true
+	TrtInt8Enable                    bool           // enable TensorRT INT8 precision. Default 0 = false, nonzero = true
+	TrtInt8CalibrationTableName      string         // TensorRT INT8 calibration table name.
+	TrtInt8UseNativeCalibrationTable bool           // use native TensorRT generated calibration table. Default 0 = false, nonzero = true
+	TrtDlaEnable                     bool           // enable DLA. Default 0 = false, nonzero = true
+	TrtDlaCore                       int            // DLA core number. Default 0
+	TrtDumpSubgraphs                 bool           // dump TRT subgraph. Default 0 = false, nonzero = true
+	TrtEngineCacheEnable             bool           // enable engine caching. Default 0 = false, nonzero = true
+	TrtEngineCachePath               string         // specify engine cache path
+	TrtEngineDecryptionEnable        bool           // enable engine decryption. Default 0 = false, nonzero = true
+	TrtEngineDecryptionLibPath       string         // specify engine decryption library path
+	TrtForceSequentialEngineBuild    bool           // force building TensorRT
+}
+
+type OrtArenaCfg = C.OrtArenaCfg
+
+type OrtCudnnConvAlgoSearch int
+
+const (
+	OrtCudnnConvAlgoSearchExhaustive OrtCudnnConvAlgoSearch = 0 // expensive exhaustive benchmarking using cudnnFindConvolutionForwardAlgorithmEx
+	OrtCudnnConvAlgoSearchHeuristic  OrtCudnnConvAlgoSearch = 1 // lightweight heuristic based search using cudnnGetConvolutionForwardAlgorithm_v7
+	OrtCudnnConvAlgoSearchDefault    OrtCudnnConvAlgoSearch = 2 // default algorithm using CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+)
+
 // The same as NewSession, but takes a slice of bytes containing the .onnx
 // network rather than a file path.
 func NewSessionWithONNXData[T TensorData](onnxData []byte, inputNames,
-	outputNames []string, inputs, outputs []*Tensor[T]) (*Session[T], error) {
+	outputNames []string, inputs, outputs []*Tensor[T], providers ...AppendOptions) (*Session[T], error) {
 	if !IsInitialized() {
 		return nil, NotInitializedError
 	}
@@ -344,8 +395,27 @@ func NewSessionWithONNXData[T TensorData](onnxData []byte, inputNames,
 	}
 
 	var ortSession *C.OrtSession
-	status := C.CreateSession(unsafe.Pointer(&(onnxData[0])),
-		C.size_t(len(onnxData)), ortEnv, &ortSession)
+	var ortSessionOption *OrtSessionOptions
+
+	status := C.CreateSessionOptions(&ortSessionOption)
+	if status != nil {
+		return nil, fmt.Errorf("Error creating sessionOptions: %w",
+			statusToError(status))
+	}
+
+	if len(providers) > 0 {
+		for _, provider := range providers {
+			if provider != nil {
+				err := provider(ortSessionOption)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	status = C.CreateSession(unsafe.Pointer(&(onnxData[0])),
+		C.size_t(len(onnxData)), ortEnv, ortSessionOption, &ortSession)
 	if status != nil {
 		return nil, fmt.Errorf("Error creating session: %w",
 			statusToError(status))
@@ -389,14 +459,15 @@ func NewSessionWithONNXData[T TensorData](onnxData []byte, inputNames,
 // The input and output tensors MUST outlive this session, and calling
 // session.Destroy() will not destroy the input or output tensors.
 func NewSession[T TensorData](onnxFilePath string, inputNames,
-	outputNames []string, inputs, outputs []*Tensor[T]) (*Session[T], error) {
+	outputNames []string, inputs, outputs []*Tensor[T], options ...AppendOptions,
+) (*Session[T], error) {
 	fileContent, e := os.ReadFile(onnxFilePath)
 	if e != nil {
 		return nil, fmt.Errorf("Error reading %s: %w", onnxFilePath, e)
 	}
 
 	toReturn, e := NewSessionWithONNXData[T](fileContent, inputNames,
-		outputNames, inputs, outputs)
+		outputNames, inputs, outputs, options...)
 	if e != nil {
 		return nil, fmt.Errorf("Error creating session from %s: %w",
 			onnxFilePath, e)
@@ -431,4 +502,70 @@ func (s *Session[T]) Run() error {
 		return fmt.Errorf("Error running network: %w", statusToError(status))
 	}
 	return nil
+}
+
+func SessionOptionsAppendExecutionProviderCUDA(options *OrtSessionOptions, cudaOptions *OrtCUDAProviderOptions) error {
+	cudaOptionsC := C.OrtCUDAProviderOptions{
+		device_id:                 C.int(cudaOptions.DeviceId),
+		cudnn_conv_algo_search:    C.OrtCudnnConvAlgoSearch(cudaOptions.CudnnConvAlgoSearch),
+		gpu_mem_limit:             C.size_t(cudaOptions.GpuMemLimit),
+		arena_extend_strategy:     C.int(cudaOptions.ArenaExtendStrategy),
+		do_copy_in_default_stream: boolToCInt(cudaOptions.DoCopyInDefaultStream),
+		has_user_compute_stream:   boolToCInt(cudaOptions.HasUserComputeStream),
+		user_compute_stream:       cudaOptions.UserComputeStream,
+		default_memory_arena_cfg:  cudaOptions.DefaultMemoryArenaCfg,
+		tunable_op_enabled:        boolToCInt(cudaOptions.TunableOpEnabled),
+	}
+	status := C.SessionOptionsAppendExecutionProvider_CUDA(options, &cudaOptionsC)
+	if status != nil {
+		return fmt.Errorf("error append provider CUDA %w", statusToError(status))
+	}
+
+	return nil
+}
+
+func SessionOptionsAppendExecutionProviderTensorRT(options *OrtSessionOptions, trtOptions *OrtTensorRTProviderOptions) error {
+	trtInt8CalibrationTableName := C.CString(trtOptions.TrtInt8CalibrationTableName)
+	defer C.free(unsafe.Pointer(trtInt8CalibrationTableName))
+
+	trtEngineCachePath := C.CString(trtOptions.TrtEngineCachePath)
+	defer C.free(unsafe.Pointer(trtEngineCachePath))
+
+	trtEngineDecryptionLibPath := C.CString(trtOptions.TrtEngineDecryptionLibPath)
+	defer C.free(unsafe.Pointer(trtEngineDecryptionLibPath))
+
+	trtOptionsC := C.OrtTensorRTProviderOptions{
+		device_id:                             C.int(trtOptions.DeviceId),
+		has_user_compute_stream:               boolToCInt(trtOptions.HasUserComputeStream),
+		user_compute_stream:                   trtOptions.UserComputeStream,
+		trt_max_partition_iterations:          C.int(trtOptions.TrtMaxPartitionIterations),
+		trt_min_subgraph_size:                 C.int(trtOptions.TrtMinSubgraphSize),
+		trt_max_workspace_size:                C.size_t(trtOptions.TrtMaxWorkspaceSize),
+		trt_fp16_enable:                       boolToCInt(trtOptions.TrtFp16Enable),
+		trt_int8_enable:                       boolToCInt(trtOptions.TrtInt8Enable),
+		trt_int8_calibration_table_name:       trtInt8CalibrationTableName,
+		trt_int8_use_native_calibration_table: boolToCInt(trtOptions.TrtInt8UseNativeCalibrationTable),
+		trt_dla_enable:                        boolToCInt(trtOptions.TrtDlaEnable),
+		trt_dla_core:                          C.int(trtOptions.TrtDlaCore),
+		trt_dump_subgraphs:                    boolToCInt(trtOptions.TrtDumpSubgraphs),
+		trt_engine_cache_enable:               boolToCInt(trtOptions.TrtEngineCacheEnable),
+		trt_engine_cache_path:                 trtEngineCachePath,
+		trt_engine_decryption_enable:          boolToCInt(trtOptions.TrtEngineDecryptionEnable),
+		trt_engine_decryption_lib_path:        trtEngineDecryptionLibPath,
+		trt_force_sequential_engine_build:     boolToCInt(trtOptions.TrtForceSequentialEngineBuild),
+	}
+
+	status := C.SessionOptionsAppendExecutionProvider_TensorRT(options, &trtOptionsC)
+	if status != nil {
+		return fmt.Errorf("error append provider CUDA %w", statusToError(status))
+	}
+
+	return nil
+}
+
+func boolToCInt(b bool) C.int {
+	if b {
+		return C.int(1)
+	}
+	return C.int(0)
 }

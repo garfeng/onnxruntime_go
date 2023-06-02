@@ -35,12 +35,15 @@ const char *GetErrorMessage(OrtStatus *status) {
   return ort_api->GetErrorMessage(status);
 }
 
-OrtStatus *CreateSession(void *model_data, size_t model_data_length,
-  OrtEnv *env, OrtSession **out) {
+OrtStatus *CreateSessionOptions(OrtSessionOptions **options) {
   OrtStatus *status = NULL;
-  OrtSessionOptions *options = NULL;
-  status = ort_api->CreateSessionOptions(&options);
-  if (status) return status;
+  status = ort_api->CreateSessionOptions(options);
+  return status;
+}
+
+OrtStatus *CreateSession(void *model_data, size_t model_data_length,
+  OrtEnv *env, OrtSessionOptions *options , OrtSession **out) {
+  OrtStatus *status = NULL;
   status = ort_api->CreateSessionFromArray(env, model_data, model_data_length,
     options, out);
   // It's OK to release the session options now, right? The docs don't say.
@@ -73,4 +76,14 @@ OrtStatus *CreateOrtTensorWithShape(void *data, size_t data_size,
   status = ort_api->CreateTensorWithDataAsOrtValue(mem_info, data, data_size,
     shape, shape_size, dtype, out);
   return status;
+}
+
+OrtStatus *SessionOptionsAppendExecutionProvider_CUDA(OrtSessionOptions *options, OrtCUDAProviderOptions* cuda_options) {
+  OrtStatus *status = NULL;
+  status = ort_api->SessionOptionsAppendExecutionProvider_CUDA(options, cuda_options);
+}
+
+OrtStatus *SessionOptionsAppendExecutionProvider_TensorRT(OrtSessionOptions *options, OrtTensorRTProviderOptions* tensor_options){
+  OrtStatus *status;
+  status = ort_api->SessionOptionsAppendExecutionProvider_TensorRT(options, tensor_options);
 }
